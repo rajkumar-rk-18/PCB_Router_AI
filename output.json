@@ -1,0 +1,62 @@
+{
+  "drc_errors": [
+    {
+      "type": "clearance",
+      "nets": [
+        "Net-(U1-FB)",
+        null
+      ],
+      "at": [
+        122.95,
+        74.35
+      ],
+      "message": "Via\u2013pad clearance (required 0.20 mm; actual 0.03 mm).",
+      "suggestion": "Move the via by \u2265 0.17 mm from this pad, or relax class clearance (not recommended).",
+      "objects": [
+        "Via [Net-(U1-FB)] \u00d80.600 at (122.9500,74.3500)",
+        "Pad [None] roundrect at (123.1900,74.9800)"
+      ]
+    },
+    {
+      "type": "clearance",
+      "nets": [
+        "Net-(U1-FB)",
+        null
+      ],
+      "at": [
+        122.95,
+        74.35
+      ],
+      "message": "Via\u2013pad clearance (required 0.20 mm; actual 0.04 mm).",
+      "suggestion": "Move the via by \u2265 0.16 mm from this pad, or relax class clearance (not recommended).",
+      "objects": [
+        "Via [Net-(U1-FB)] \u00d80.600 at (122.9500,74.3500)",
+        "Pad [None] roundrect at (123.1900,73.7100)"
+      ]
+    },
+    {
+      "type": "shorting_items",
+      "nets": [
+        "Net-(U1-OUT)",
+        null
+      ],
+      "at": [
+        121.95,
+        75.6
+      ],
+      "message": "Via\u2013pad clearance (required 0.20 mm; actual -0.01 mm).",
+      "suggestion": "Move the via by \u2265 0.21 mm from this pad, or relax class clearance (not recommended).",
+      "objects": [
+        "Via [Net-(U1-OUT)] \u00d80.800 at (121.9500,75.6000)",
+        "Pad [None] roundrect at (123.1900,74.9800)"
+      ]
+    }
+  ],
+  "summary": {
+    "error_count": 3,
+    "by_type": {
+      "clearance": 2,
+      "shorting_items": 1
+    }
+  }
+}
