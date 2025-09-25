@@ -68,7 +68,7 @@ def clear_pad_region(grid, pad, layer):
     clearance = float(pad.get("clearance", 0.2))
     rot = float(pad.get("abs_rotation", pad.get("pad_rotation", 0.0)))  # <-- use abs rot
 
-    if shape in ("roundrect", "rect"):
+    if shape in ("roundrect", "rect", "oval"):
         hx = float(pad.get("size_x", 0.0)) / 2.0 + clearance
         hy = float(pad.get("size_y", 0.0)) / 2.0 + clearance
         # bounding square to limit the scan
@@ -83,7 +83,7 @@ def clear_pad_region(grid, pad, layer):
                 if _inside_rotated_rect(cx, cy, pad["x"], pad["y"], hx, hy, rot):
                     grid.clear_block(ix, iy, layer)
     else:
-        # circle branch stays as you had it
+        # circle branch
         r = float(pad.get("radius", 0.2)) + clearance
         ix0, iy0 = grid.world_to_grid(pad["x"] - r, pad["y"] - r)
         ix1, iy1 = grid.world_to_grid(pad["x"] + r, pad["y"] + r)
@@ -102,7 +102,7 @@ def set_pad_region(grid, pad, layer):
     clearance = float(pad.get("clearance", 0.2)) + float(RULES.get("pad_clearance_extra", 0.0))
     rot = float(pad.get("abs_rotation", pad.get("pad_rotation", 0.0)))
 
-    if shape in ("roundrect", "rect"):
+    if shape in ("roundrect", "rect", "oval"):
         hx = float(pad.get("size_x", 0.0)) / 2.0 + clearance
         hy = float(pad.get("size_y", 0.0)) / 2.0 + clearance
         b = max(hx, hy)
@@ -135,15 +135,34 @@ def set_pad_region(grid, pad, layer):
 # -----------------------
 
 def _normalize_layer_name(name, grid_layers, rules_net=None):
+    # Treat KiCad "*.Cu" as "pick a practical copper layer"
+    if name == "*.Cu":
+        # Prefer F.Cu, then B.Cu, else first copper layer
+        for pref in ("F.Cu", "B.Cu"):
+            if pref in grid_layers:
+                return pref
+        return grid_layers[0]
+
     if name in grid_layers:
         return name
-    # treat wildcards or combined tokens as “pick something workable”
+
     allowed = (rules_net or {}).get("allowed_layers") or grid_layers
-    # Prefer F.Cu, then B.Cu, else the first allowed
     for pref in ("F.Cu", "B.Cu"):
         if pref in allowed:
             return pref
     return allowed[0]
+
+
+def _clear_disk(grid, ix, iy, il, radius_mm):
+    """Temporarily clear a disk of given radius (mm) on (ix,iy,layer)."""
+    r_cells = int(math.ceil(radius_mm / grid.step))
+    for dx in range(-r_cells, r_cells + 1):
+        for dy in range(-r_cells, r_cells + 1):
+            jx, jy = ix + dx, iy + dy
+            if not grid.in_bounds(jx, jy):
+                continue
+            if (dx * grid.step) ** 2 + (dy * grid.step) ** 2 <= radius_mm ** 2 + 1e-12:
+                grid.clear_block(jx, jy, il)
 
 
 def rules_for_net(global_rules, net_name, net_id):
@@ -171,29 +190,47 @@ def _block_disk(grid, ix, iy, il, radius_mm):
             if (dx * grid.step) ** 2 + (dy * grid.step) ** 2 <= radius_mm ** 2 + 1e-12:
                 grid.set_block(jx, jy, il)
 
+def _disk_is_free(grid, ix, iy, il, radius_mm):
+    """
+    True iff every grid cell within 'radius_mm' of (ix,iy) on layer 'il'
+    is free of obstacles/pad copper.
+    """
+    r_cells = int(math.ceil(radius_mm / grid.step))
+    r2 = radius_mm * radius_mm + 1e-12
+    for dx in range(-r_cells, r_cells + 1):
+        for dy in range(-r_cells, r_cells + 1):
+            if (dx * grid.step) ** 2 + (dy * grid.step) ** 2 > r2:
+                continue
+            jx, jy = ix + dx, iy + dy
+            if not grid.in_bounds(jx, jy):
+                return False
+            if grid.occ[il][jx][jy] or grid.pad_mask[jx][jy]:
+                return False
+    return True
+
 
 def block_path_as_obstacles(grid, rules, path_cells, vias_raw):
     """
     After a net is routed, mark its copper (trace & vias) as obstacles for later nets.
     Uses trace_width/2 + clearance as the blocking radius (plus optional extra).
     """
-    trace_w = float(rules.get("trace_width", 0.25))
+    trace_w   = float(rules.get("trace_width", 0.25))
     clearance = float(rules.get("clearance", 0.2))
-    extra = float(rules.get("trace_clearance_extra", 0.0))  # optional knob
-    r_trace = 0.5 * trace_w + clearance + extra
+    extra_t   = float(rules.get("trace_clearance_extra", 0.0))
+    r_trace   = 0.5 * trace_w + clearance + extra_t
 
-    # Block each path cell on its layer (this already covers the centerline).
     for ix, iy, il in path_cells:
         _block_disk(grid, ix, iy, il, r_trace)
 
-    # Block vias on both layers they connect (use via_size/2 + clearance).
-    via_size = float(rules.get("via_size", 0.6))
-    r_via = 0.5 * via_size + clearance + extra
+    via_size  = float(rules.get("via_size", 0.6))
+    extra_v   = float(rules.get("via_clearance_extra", 0.0))  # optional knob
+    r_via     = 0.5 * via_size + clearance + extra_v
     for v in vias_raw:
         vix, viy = grid.world_to_grid(v["x"], v["y"])
         for lname in (v["from"], v["to"]):
             il = grid.layers.index(lname)
             _block_disk(grid, vix, viy, il, r_via)
+
 
 
 def find_pad_for_point(obstacles, x, y, layer_name, tol=0.8):
@@ -206,8 +243,9 @@ def find_pad_for_point(obstacles, x, y, layer_name, tol=0.8):
     for o in obstacles:
         if o.get("type") != "pad":
             continue
-        # If the pad is layer-specific, match it; otherwise it applies to all layers
-        if o.get("layer") and o.get("layer") != layer_name:
+        pad_layer = o.get("layer")
+        # "*.Cu" matches any copper layer
+        if pad_layer and pad_layer not in (layer_name, "*.Cu"):
             continue
         d = abs(float(o["x"]) - float(x)) + abs(float(o["y"]) - float(y))
         if d < bestd and d <= tol:
@@ -219,11 +257,11 @@ def find_pad_for_point(obstacles, x, y, layer_name, tol=0.8):
 def clear_full_pad_access(grid, pad, layer_index, rules):
     """
     Temporarily clear the *entire* pad copper + a small extra so a track fits through.
-    We do this only on the pad's routing layer (layer_index). After routing,
+    Do this on the pad's routing layer (layer_index). After routing,
     call set_pad_region(grid, pad, layer_index) to restore blocking.
     """
     if not pad:
-        return  # nothing to do
+        return
 
     # Extra opening so the trace (width) can pass the pad boundary comfortably
     trace_w = float(rules.get("trace_width", 0.25))
@@ -234,7 +272,6 @@ def clear_full_pad_access(grid, pad, layer_index, rules):
     base_clear = float(pad.get("clearance", float(rules.get("clearance", 0.2))))
     pad_copy["clearance"] = base_clear + extra
 
-    # Clear full pad geometry (rect/roundrect/circle) on this layer
     clear_pad_region(grid, pad_copy, layer_index)
 
 
@@ -270,23 +307,43 @@ def expand_boundary_to_include(boundary, minx, maxx, miny, maxy, margin):
 
 
 def rasterize_obstacles(grid, rules, obstacles):
+    """
+    Rasterize pads (SMD + THT) and polygon obstacles into grid. 
+    Rect/roundrect/oval pads use a rotated-rectangle test so rotation/orientation is honored.
+    THT pads ("*.Cu") get an optional extra clearance ring: rules["tht_clearance_extra"].
+    """
     clearance_default = float(rules.get("clearance", 0.2))
+    pad_extra         = float(rules.get("pad_clearance_extra", 0.0))
+    tht_extra         = float(rules.get("tht_clearance_extra", 0.0))  # <— NEW
 
     for obs in obstacles:
         if obs.get("type") == "pad":
-            x, y = obs["x"], obs["y"]
-            pad_extra = float(rules.get("pad_clearance_extra", 0.0))
-            clearance = float(obs.get("clearance", clearance_default)) + pad_extra
+            x = float(obs["x"]); y = float(obs["y"])
             shape = obs.get("shape", "circle")
+            rot   = float(obs.get("abs_rotation", obs.get("pad_rotation", 0.0)))
 
             layer_name = obs.get("layer")
-            layers = [layer_name] if layer_name else grid.layers
+            if layer_name == "*.Cu":
+                layers = grid.layers[:]                 # THT: block on all copper layers
+            elif layer_name:
+                layers = [layer_name]
+            else:
+                layers = grid.layers[:]
 
-            if shape in ("roundrect", "rect"):
-                sx = float(obs.get("size_x", 0.0)) / 2.0 + clearance
-                sy = float(obs.get("size_y", 0.0)) / 2.0 + clearance
-                ix0, iy0 = grid.world_to_grid(x - sx, y - sy)
-                ix1, iy1 = grid.world_to_grid(x + sx, y + sy)
+            # base + project pad bump (+ extra for THT)
+            base_clear = float(obs.get("clearance", clearance_default))
+            clearance  = base_clear + pad_extra + (tht_extra if layer_name == "*.Cu" else 0.0)
+
+            if shape in ("roundrect", "rect", "oval"):
+                # Treat oval as a rotated rectangle using size_x/size_y
+                hx = float(obs.get("size_x", 0.0)) / 2.0 + clearance
+                hy = float(obs.get("size_y", 0.0)) / 2.0 + clearance
+
+                # scan a bounding box, test with rotated-rect predicate
+                bb = max(hx, hy)
+                ix0, iy0 = grid.world_to_grid(x - bb, y - bb)
+                ix1, iy1 = grid.world_to_grid(x + bb, y + bb)
+
                 for il, lname in enumerate(grid.layers):
                     if lname not in layers:
                         continue
@@ -295,15 +352,15 @@ def rasterize_obstacles(grid, rules, obstacles):
                             if not grid.in_bounds(ix, iy):
                                 continue
                             cx, cy = grid.grid_to_world(ix, iy)
-                            if (x - sx) <= cx <= (x + sx) and (y - sy) <= cy <= (y + sy):
+                            if _inside_rotated_rect(cx, cy, x, y, hx, hy, rot):
                                 grid.pad_mask[ix][iy] = True
                                 grid.set_block(ix, iy, il)
 
             elif shape == "circle":
-                r = float(obs.get("radius", 0.2))
-                total_r = r + clearance
-                ix0, iy0 = grid.world_to_grid(x - total_r, y - total_r)
-                ix1, iy1 = grid.world_to_grid(x + total_r, y + total_r)
+                r = float(obs.get("radius", 0.2)) + clearance
+                ix0, iy0 = grid.world_to_grid(x - r, y - r)
+                ix1, iy1 = grid.world_to_grid(x + r, y + r)
+
                 for il, lname in enumerate(grid.layers):
                     if lname not in layers:
                         continue
@@ -313,12 +370,12 @@ def rasterize_obstacles(grid, rules, obstacles):
                                 continue
                             cx, cy = grid.grid_to_world(ix, iy)
                             dx, dy = cx - x, cy - y
-                            if dx * dx + dy * dy <= (total_r * total_r):
+                            if dx*dx + dy*dy <= r*r:
                                 grid.pad_mask[ix][iy] = True
                                 grid.set_block(ix, iy, il)
 
-
         elif obs.get("polygon"):
+            # Simple polygon grow-by-clearance raster (unchanged)
             poly = obs["polygon"]
             xs = [px for px, _ in poly]
             ys = [py for _, py in poly]
@@ -338,13 +395,14 @@ def rasterize_obstacles(grid, rules, obstacles):
                             grid.set_block(ix, iy, il)
 
 
+
 def octile(x0, y0, x1, y1):
     dx = abs(x1 - x0)
     dy = abs(y1 - y0)
     return (dx + dy) + (math.sqrt(2) - 2) * min(dx, dy)
 
 
-def compress_collinear(path):
+def compress_collinear(path, ang_eps_deg=5.0):
     if not path:
         return []
     out = [path[0]]
@@ -354,30 +412,41 @@ def compress_collinear(path):
         x2, y2, l2 = path[i + 1]
         dx1, dy1 = x1 - x0, y1 - y0
         dx2, dy2 = x2 - x1, y2 - y1
-        if l0 == l1 == l2 and (dx1, dy1) != (0, 0):
+        if l0 == l1 == l2 and (dx1 or dy1) and (dx2 or dy2):
             if dx1 * dy2 == dy1 * dx2:
+                continue
+            a1 = math.atan2(dy1, dx1)
+            a2 = math.atan2(dy2, dx2)
+            da = (a2 - a1 + math.pi) % (2*math.pi) - math.pi
+            if abs(da) < math.radians(ang_eps_deg):
                 continue
         out.append((x1, y1, l1))
     out.append(path[-1])
     return out
 
 
+
 # -----------------------
 # A* search helper (balanced via rules)
 # -----------------------
 
-def astar_search(grid, rules, start_state, goal_state, allow_via):
+def astar_search(grid, rules, start_state, goal_state, allow_via, start_xy, goal_xy):
     """Generic A* search with balanced via rules + min distance from pads for vias."""
     start_ix, start_iy, start_layer = start_state
     goal_ix, goal_iy, goal_layer = goal_state
 
     # Heuristics / costs
     via_cost = float(rules.get("via_cost", 10.0))  # balanced penalty
-
-    # NEW: min distance (mm) from start/goal pad centers required to drop a via
     min_via_from_pads = float(rules.get("min_via_from_pads", 0.6))
-    sx, sy = grid.grid_to_world(start_ix, start_iy)
-    gx, gy = grid.grid_to_world(goal_ix, goal_iy)
+
+    # Via radius used for local clearance check
+    via_size  = float(rules.get("via_size", 0.6))
+    clearance = float(rules.get("clearance", 0.2))
+    extra_v   = float(rules.get("via_clearance_extra", 0.0))
+    r_via     = 0.5 * via_size + clearance + extra_v
+
+    sx, sy = float(start_xy[0]), float(start_xy[1])
+    gx, gy = float(goal_xy[0]),  float(goal_xy[1])
 
     neighbors = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
                  (1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2)),
@@ -465,22 +534,31 @@ def astar_search(grid, rules, start_state, goal_state, allow_via):
             if best_neighbor_heuristic >= current_h - 1e-9:
                 allow_via_here = True
 
-        # ---- propose via (with new min-distance-from-pads rule) ----
-        if allow_via and allow_via_here:
+        # ---- propose via (EARLY-WINDOW + stall gate + full-disk clearance) ----
+        if allow_via:
             cx, cy = grid.grid_to_world(ix, iy)
 
-            # must be at least D mm from BOTH start and goal pad centers
-            if (math.hypot(cx - sx, cy - sy) >= min_via_from_pads and
-                math.hypot(cx - gx, cy - gy) >= min_via_from_pads):
+            # Via allowed if either:
+            #  1) we're far enough from the nearer pad center (early window), OR
+            #  2) the search is "stalled" (no strictly better planar move)
+            d_start = math.hypot(cx - sx, cy - sy)
+            d_goal  = math.hypot(cx - gx, cy - gy)
+            distance_ok = (min(d_start, d_goal) >= min_via_from_pads)
 
+            allow_drop = allow_via_here or distance_ok
+
+            if allow_drop:
                 for jl in range(len(grid.layers)):
                     if jl == il:
                         continue
                     if allowed_via_layers is not None and jl not in allowed_via_layers:
                         continue
-                    if grid.is_blocked(ix, iy, jl):
+                    if grid.is_blocked(ix, iy, jl) or grid.is_blocked(ix, iy, il):
                         continue
-                    if grid.is_blocked(ix, iy, il):
+                    # Ensure the *full* via disk is free on BOTH layers
+                    if not _disk_is_free(grid, ix, iy, il, r_via):
+                        continue
+                    if not _disk_is_free(grid, ix, iy, jl, r_via):
                         continue
 
                     cand = (ix, iy, jl)
@@ -490,8 +568,32 @@ def astar_search(grid, rules, start_state, goal_state, allow_via):
                         g_score[cand] = tg
                         push_state(cand, tg)
 
+
     raise RuntimeError("No route found")
 
+def _path_cost(grid, rules, path):
+    """A* cost used for comparison: unit/sqrt2 per grid move + via_cost per layer change."""
+    if not path or len(path) < 2:
+        return 0.0
+    via_cost = float(rules.get("via_cost", 10.0))
+    cost = 0.0
+    for i in range(1, len(path)):
+        (ix0, iy0, il0) = path[i-1]
+        (ix1, iy1, il1) = path[i]
+        if il1 != il0:
+            cost += via_cost
+        else:
+            dx = abs(ix1 - ix0)
+            dy = abs(iy1 - iy0)
+            # 4/8-way grid: each step is 1 or sqrt(2)
+            if dx == 1 and dy == 1:
+                cost += math.sqrt(2)
+            elif (dx == 1 and dy == 0) or (dx == 0 and dy == 1):
+                cost += 1.0
+            else:
+                # fall back to Euclidean in rare compress/degenerate cases
+                cost += math.hypot(dx, dy)
+    return cost
 
 
 def astar_route(grid, rules, start, goal):
@@ -499,35 +601,62 @@ def astar_route(grid, rules, start, goal):
         raise RuntimeError("Missing start or goal in astar_route")
 
     start_ix, start_iy = grid.world_to_grid(start["x"], start["y"])
-    goal_ix, goal_iy = grid.world_to_grid(goal["x"], goal["y"])
+    goal_ix,  goal_iy  = grid.world_to_grid(goal["x"],  goal["y"])
 
     if not grid.in_bounds(start_ix, start_iy) or not grid.in_bounds(goal_ix, goal_iy):
         raise RuntimeError("Start or goal out of grid bounds in astar_route")
 
-    start_layer = grid.layers.index(start.get("layer", grid.layers[0]))
-    goal_layer = grid.layers.index(goal.get("layer", grid.layers[0]))
+    s_name = _normalize_layer_name(start.get("layer", grid.layers[0]), grid.layers, rules)
+    g_name = _normalize_layer_name(goal.get("layer",  grid.layers[0]), grid.layers, rules)
+
+    start_layer = grid.layers.index(s_name)
+    goal_layer  = grid.layers.index(g_name)
     start_state = (start_ix, start_iy, start_layer)
-    goal_state = (goal_ix, goal_iy, goal_layer)
+    goal_state  = (goal_ix,  goal_iy,  goal_layer)
 
-    if start_layer == goal_layer:
-        try:
-            path, vias = astar_search(grid, rules, start_state, goal_state, allow_via=False)
-            return path, vias
-        except RuntimeError:
-            pass
+    best = None  # (cost, path, vias)
 
-    path, vias = astar_search(grid, rules, start_state, goal_state, allow_via=True)
+    # 1) Try planar (no vias)
+    try:
+        path0, vias0 = astar_search(
+            grid, rules, start_state, goal_state,
+            allow_via=False,
+            start_xy=(start["x"], start["y"]),
+            goal_xy=(goal["x"], goal["y"])
+        )
+        best = (_path_cost(grid, rules, path0), path0, vias0)
+    except RuntimeError:
+        pass
+
+    # 2) Try with vias enabled
+    try:
+        path1, vias1 = astar_search(
+            grid, rules, start_state, goal_state,
+            allow_via=True,
+            start_xy=(start["x"], start["y"]),
+            goal_xy=(goal["x"], goal["y"])
+        )
+        cand = (_path_cost(grid, rules, path1), path1, vias1)
+        if (best is None) or (cand[0] + 1e-9 < best[0]):
+            best = cand
+    except RuntimeError:
+        pass
+
+    if best is None:
+        raise RuntimeError("No route found")
+
+    _, path, vias = best
     return path, vias
 
 
+
 # -----------------------
-# Geometry helpers for DRC (left in place but no longer used)
+# (Old) DRC Engine (kept, but unused)
 # -----------------------
 
 def _local_to_world(lx, ly, px, py, rot_deg):
     t = math.radians(rot_deg or 0.0)
     ct, st = math.cos(t), math.sin(t)
-    # rotate by +theta and shift back to (px,py)
     wx = px + lx*ct - ly*st
     wy = py + lx*st + ly*ct
     return wx, wy
@@ -539,18 +668,14 @@ def _clamp01(t):
     return 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
 
 def _seg_seg_distance(p1, p2, q1, q2):
-    """
-    Return (dist, cp1, cp2, intersects_centerlines) between segments p1->p2 and q1->q2.
-    cp1/cp2 are closest points (x,y).
-    """
     x1,y1 = p1; x2,y2 = p2
     x3,y3 = q1; x4,y4 = q2
     ux, uy = x2-x1, y2-y1
     vx, vy = x4-x3, y4-y3
     wx, wy = x1-x3, y1-y3
-    a = _dot(ux,uy,ux,uy)       # |u|^2
+    a = _dot(ux,uy,ux,uy)
     b = _dot(ux,uy,vx,vy)
-    c = _dot(vx,vy,vx,vy)       # |v|^2
+    c = _dot(vx,vy,vx,vy)
     d = _dot(ux,uy,wx,wy)
     e = _dot(vx,vy,wx,wy)
     D = a*c - b*b
@@ -601,13 +726,10 @@ def _seg_seg_distance(p1, p2, q1, q2):
     dx = cx1 - cx2; dy = cy1 - cy2
     dist = math.hypot(dx, dy)
 
-    # Exact centerline intersection?
-    # If segments strictly cross, both sc and tc in (0,1) and dist ~ 0
     intersects = (dist < 1e-6) and (0.0 <= sc <= 1.0) and (0.0 <= tc <= 1.0)
     return dist, (cx1, cy1), (cx2, cy2), intersects
 
 def _pt_seg_distance(pt, a, b):
-    """Distance from point to segment."""
     x,y = pt; x1,y1 = a; x2,y2 = b
     vx,vy = x2-x1,y2-y1
     if abs(vx) < 1e-12 and abs(vy) < 1e-12:
@@ -617,12 +739,10 @@ def _pt_seg_distance(pt, a, b):
     return math.hypot(x-cx, y-cy), (cx,cy)
 
 def _dist_seg_to_circle(seg_a, seg_b, cx, cy, radius):
-    """Centerline distance from segment to circle boundary (>=0 outside, <0 overlap)."""
     d, cp = _pt_seg_distance((cx,cy), seg_a, seg_b)
     return d - radius, cp
 
 def _rotate_to_local(x, y, px, py, rot_deg):
-    """Rotate (x,y) around (px,py) by -rot_deg to pad-local frame."""
     t = math.radians(rot_deg or 0.0)
     ct, st = math.cos(t), math.sin(t)
     dx, dy = x - px, y - py
@@ -631,25 +751,16 @@ def _rotate_to_local(x, y, px, py, rot_deg):
     return lx, ly
 
 def _seg_rect_distance_local(a, b, hx, hy):
-    """
-    Distance between segment AB and axis-aligned rectangle centered at origin with half sizes hx, hy.
-    Returns (dist, cp_on_seg) with dist >= 0 when outside, < 0 when overlapping.
-    """
-    # If either endpoint inside rectangle, overlap
     for px,py in (a,b):
         if (-hx <= px <= hx) and (-hy <= py <= hy):
-            # measure how deep inside (negative clearance as min distance to an edge)
             d = -min(hx - abs(px), hy - abs(py))
             return d, (px,py)
-
-    # Rectangle edges as segments
     edges = [
         ((-hx,-hy), ( hx,-hy)),
         (( hx,-hy), ( hx, hy)),
         (( hx, hy), (-hx, hy)),
         ((-hx, hy), (-hx,-hy)),
     ]
-
     best_d = 1e9
     best_cp = None
     for e1, e2 in edges:
@@ -660,11 +771,6 @@ def _seg_rect_distance_local(a, b, hx, hy):
     return best_d, best_cp
 
 def _track_pad_clearance(seg_a, seg_b, width, pad):
-    """
-    Signed clearance from a track (centerline AB, width) to a pad (rect/roundrect/circle).
-    Positive => clearance; negative => overlap.
-    Returns (actual_clearance, at_point).
-    """
     shape = pad.get("shape","rect")
     rot = float(pad.get("abs_rotation", pad.get("pad_rotation", 0.0)))
     px, py = pad["x"], pad["y"]
@@ -672,22 +778,18 @@ def _track_pad_clearance(seg_a, seg_b, width, pad):
     if shape in ("rect","roundrect"):
         hx = float(pad.get("size_x",0.0))/2.0
         hy = float(pad.get("size_y",0.0))/2.0
-        # Transform segment endpoints to pad local frame
         a_loc = _rotate_to_local(seg_a[0], seg_a[1], px, py, rot)
         b_loc = _rotate_to_local(seg_b[0], seg_b[1], px, py, rot)
         d, cp = _seg_rect_distance_local(a_loc, b_loc, hx, hy)
-        # Clearance from track edge to pad edge:
         cp_world = _local_to_world(cp[0], cp[1], px, py, rot)
         return d - (width/2.0), cp_world
     else:
-        # treat as circle
         r = float(pad.get("radius", 0.2))
         d, cp = _dist_seg_to_circle(seg_a, seg_b, px, py, r)
         cp_world = _local_to_world(cp[0], cp[1], px, py, rot)
         return d - (width/2.0), cp_world
 
 def _via_pad_clearance(cx, cy, via_diam, pad):
-    """Signed clearance between via (circle) and pad."""
     shape = pad.get("shape","rect")
     rot = float(pad.get("abs_rotation", pad.get("pad_rotation", 0.0)))
     px, py = pad["x"], pad["y"]
@@ -696,7 +798,6 @@ def _via_pad_clearance(cx, cy, via_diam, pad):
         hx = float(pad.get("size_x",0.0))/2.0
         hy = float(pad.get("size_y",0.0))/2.0
         v_loc = _rotate_to_local(cx, cy, px, py, rot)
-        # distance from a POINT to rectangle (>=0 outside, <0 inside)
         x, y = v_loc
         dx = max(abs(x) - hx, 0.0)
         dy = max(abs(y) - hy, 0.0)
@@ -753,85 +854,191 @@ def route_all(input_data):
     grid = Grid(boundary_expanded, layers, step)
     rasterize_obstacles(grid, rules, obstacles)
 
+    # small helper: open a circular window (radius in mm) as free space on a given layer index
+    def _open_disk(ix, iy, il, radius_mm):
+        r_cells = int(math.ceil(radius_mm / grid.step))
+        for dx in range(-r_cells, r_cells + 1):
+            for dy in range(-r_cells, r_cells + 1):
+                if (dx * grid.step) ** 2 + (dy * grid.step) ** 2 <= radius_mm ** 2 + 1e-12:
+                    jx, jy = ix + dx, iy + dy
+                    if grid.in_bounds(jx, jy):
+                        grid.clear_block(jx, jy, il)
+
     routes = []
     for task in tasks:
         net = task.get("net")
         net_id = task.get("net_id")
         start = task.get("start")
-        goal = task.get("goal")
+        goal  = task.get("goal")
         if not start or not goal:
             routes.append({"net": net, "net_id": net_id, "failed": True, "reason": "Missing start or goal"})
             continue
+
         rules_net, cls_name = rules_for_net(rules, net, net_id)
-        s_layer_name = _normalize_layer_name(start.get("layer", grid.layers[0]), grid.layers, rules_net)
-        g_layer_name = _normalize_layer_name(goal.get("layer",  grid.layers[0]), grid.layers, rules_net)
-        start_layer  = grid.layers.index(s_layer_name)
-        goal_layer   = grid.layers.index(g_layer_name)
 
-        # Find real pads so we can clear the full pad geometry (not just the center dot)
-        start_pad = find_pad_for_point(obstacles, start["x"], start["y"], grid.layers[start_layer])
-        goal_pad  = find_pad_for_point(obstacles, goal["x"],  goal["y"],  grid.layers[goal_layer])
+        # Candidate layers for start/goal (handle "*.Cu")
+        def _cand_layers(layer_token):
+            if layer_token == "*.Cu":
+                return list(grid.layers)  # try all copper layers
+            return [_normalize_layer_name(layer_token, grid.layers, rules_net)]
 
-        # Open full pad copper (plus a little extra) so a trace can enter/exit
-        clear_full_pad_access(grid, start_pad, start_layer, rules_net)
-        clear_full_pad_access(grid, goal_pad,  goal_layer,  rules_net)
+        start_layer_names = _cand_layers(start.get("layer", grid.layers[0]))
+        goal_layer_names  = _cand_layers(goal.get("layer",  grid.layers[0]))
 
-        try:
-            path_cells, vias_raw = astar_route(grid, rules_net, start, goal)
-        except Exception as e:
-            # Restore original pad blocking before reporting failure
-            if start_pad: set_pad_region(grid, start_pad, start_layer)
-            if goal_pad:  set_pad_region(grid, goal_pad,  goal_layer)
-            routes.append({"net": net, "net_id": net_id, "failed": True, "reason": str(e), "netclass": cls_name})
-            continue
+        # --- OPTIONAL: reuse an existing same-net via as an anchor/junction ---
+        reuse_same_net_via = bool(rules_net.get("reuse_same_net_via", False))
+        chosen_anchor = None
+        anchor_layers = None
+        if reuse_same_net_via and routes:
+            candidates = []
+            for rr in routes:
+                if rr.get("failed") or rr.get("net_id") != net_id:
+                    continue
+                for v in rr.get("vias", []):
+                    candidates.append(v)
+            if candidates:
+                sx, sy = start["x"], start["y"]
+                def vd2(v):
+                    vx, vy = float(v["at"][0]), float(v["at"][1])
+                    return (vx - sx) ** 2 + (vy - sy) ** 2
+                chosen_anchor = min(candidates, key=vd2)
+                anchor_layers = (chosen_anchor.get("from"), chosen_anchor.get("to"))
 
-        # Restore original pad blocking after success
-        if start_pad: set_pad_region(grid, start_pad, start_layer)
-        if goal_pad:  set_pad_region(grid, goal_pad,  goal_layer)
- 
-        # lock in this route as an obstacle so later nets can't cross it
-        block_path_as_obstacles(grid, rules_net, path_cells, vias_raw)
+        route_found = False
+        last_error = None
 
-        # Convert path to world segments
-        world_path = []
-        for ix, iy, il in path_cells:
-            x, y = grid.grid_to_world(ix, iy)
-            world_path.append((round(x, 6), round(y, 6), grid.layers[il]))
+        # Try all (startLayer, goalLayer) pairs until one succeeds
+        for sL_name in start_layer_names:
+            sL = grid.layers.index(sL_name)
+            start_pad = find_pad_for_point(obstacles, start["x"], start["y"], sL_name)
 
-        simplified = compress_collinear(world_path)
+            for gL_name in goal_layer_names:
+                gL = grid.layers.index(gL_name)
+                goal_pad = find_pad_for_point(obstacles, goal["x"], goal["y"], gL_name)
 
-        segments = []
-        for i in range(len(simplified) - 1):
-            x0, y0, l0 = simplified[i]
-            x1, y1, l1 = simplified[i + 1]
-            if l0 == l1:
-                segments.append({
-                    "start": [x0, y0],
-                    "end": [x1, y1],
-                    "layer": l0,
-                    "width": float(rules_net.get("trace_width", 0.25))
-                })
+                # Open the pad copper (plus extra) on the specific attempt layers
+                # If the pad is "*.Cu" (THT), open on ALL copper layers
+                if start_pad:
+                    if start_pad.get("layer") == "*.Cu":
+                        for li in range(len(grid.layers)):
+                            clear_full_pad_access(grid, start_pad, li, rules_net)
+                    else:
+                        clear_full_pad_access(grid, start_pad, sL, rules_net)
 
-        vias = []
-        for via in vias_raw:
-            vias.append({
-                "at": [round(via["x"], 6), round(via["y"], 6)],
-                "from": via["from"],
-                "to": via["to"],
-                "size": float(rules_net.get("via_size", 0.6)),
-                "drill": float(rules_net.get("via_drill", 0.3))
+                if goal_pad:
+                    if goal_pad.get("layer") == "*.Cu":
+                        for li in range(len(grid.layers)):
+                            clear_full_pad_access(grid, goal_pad, li, rules_net)
+                    else:
+                        clear_full_pad_access(grid, goal_pad,  gL, rules_net)
+
+                # If we have an anchor via, open a small window at its location and steer goal to it (on sL)
+                opened_anchor = False
+                goal_try = {"x": goal["x"], "y": goal["y"], "layer": gL_name}
+                if chosen_anchor:
+                    vx, vy = float(chosen_anchor["at"][0]), float(chosen_anchor["at"][1])
+                    via_size = float(chosen_anchor.get("size", rules_net.get("via_size", 0.6)))
+                    clearance = float(rules_net.get("clearance", 0.2))
+                    open_r = 0.5 * via_size + clearance
+                    vix, viy = grid.world_to_grid(vx, vy)
+
+                    for lname in anchor_layers:
+                        if lname in grid.layers:
+                            il = grid.layers.index(lname)
+                            _open_disk(vix, viy, il, open_r)
+
+                    goal_try = {"x": vx, "y": vy, "layer": sL_name}
+                    opened_anchor = True
+
+                try:
+                    start_try = {"x": start["x"], "y": start["y"], "layer": sL_name}
+                    path_cells, vias_raw = astar_route(grid, rules_net, start_try, goal_try)
+
+                    # Restore pad blocking on success
+                    def _restore_pad(pad, default_li):
+                        if not pad: return
+                        if pad.get("layer") == "*.Cu":
+                            for li in range(len(grid.layers)):
+                                set_pad_region(grid, pad, li)
+                        else:
+                            set_pad_region(grid, pad, default_li)
+
+                    _restore_pad(start_pad, sL)
+                    _restore_pad(goal_pad,  gL)
+
+                    # Freeze this route (tracks + vias) as obstacles
+                    block_path_as_obstacles(grid, rules_net, path_cells, vias_raw)
+
+                    # Convert path to world segments
+                    world_path = []
+                    for ix, iy, il in path_cells:
+                        x, y = grid.grid_to_world(ix, iy)
+                        world_path.append((round(x, 6), round(y, 6), grid.layers[il]))
+
+                    simplified = compress_collinear(world_path)
+
+                    segments = []
+                    for i in range(len(simplified) - 1):
+                        x0, y0, l0 = simplified[i]
+                        x1, y1, l1 = simplified[i + 1]
+                        if l0 == l1:
+                            segments.append({
+                                "start": [x0, y0],
+                                "end":   [x1, y1],
+                                "layer": l0,
+                                "width": float(rules_net.get("trace_width", 0.25))
+                            })
+
+                    vias_out = []
+                    for via in vias_raw:
+                        vias_out.append({
+                            "at":   [round(via["x"], 6), round(via["y"], 6)],
+                            "from": via["from"],
+                            "to":   via["to"],
+                            "size": float(rules_net.get("via_size", 0.6)),
+                            "drill":float(rules_net.get("via_drill", 0.3))
+                        })
+
+                    routes.append({
+                        "net": net,
+                        "net_id": net_id,
+                        "netclass": cls_name,
+                        "segments": segments,
+                        "vias": vias_out
+                    })
+
+                    route_found = True
+                    break  # gL loop
+                except Exception as e:
+                    last_error = str(e)
+                    # Restore pad blocking before trying next pair
+                    def _restore_pad_fail(pad, default_li):
+                        if not pad: return
+                        if pad.get("layer") == "*.Cu":
+                            for li in range(len(grid.layers)):
+                                set_pad_region(grid, pad, li)
+                        else:
+                            set_pad_region(grid, pad, default_li)
+
+                    _restore_pad_fail(start_pad, sL)
+                    _restore_pad_fail(goal_pad,  gL)
+                    # continue to next (sL, gL)
+
+            if route_found:
+                break  # sL loop
+
+        if not route_found:
+            routes.append({
+                "net": net,
+                "net_id": net_id,
+                "failed": True,
+                "reason": last_error or "No route found",
+                "netclass": cls_name
             })
-
-        routes.append({
-            "net": net,
-            "net_id": net_id,
-            "netclass": cls_name,
-            "segments": segments,
-            "vias": vias
-        })
 
     # ----------- DRC stage removed -----------
     return {"routes": routes}
+
 
 
 # -----------------------

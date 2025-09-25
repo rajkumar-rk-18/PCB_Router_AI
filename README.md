@@ -13,7 +13,9 @@ It parses `.kicad_pcb` files, generates routes, and injects them back into the P
 1. Two sample PCB files are included:
    - `Simple_Demo.kicad_pcb`: Single-layer design (works perfectly).
    - `Simple_Via.kicad_pcb`: Modified design with a component on the back layer for via testing.
-2. Vias are created successfully, but **via-to-pad clearance DRC errors** still exist (needs fixing).
+   - `via2.kicad_pcb`: It has a THT component to be work on.
+2. Vias are created successfully.
+3. Currently working on handling Through Hole Components.
 3. Next step: extend support for **4-layer PCBs**.
 
 ## Usage
@@ -41,13 +43,12 @@ Open `<filename>_routed.kicad_pcb` in KiCad to check the generated routes.
 
 ## Notes
 - Works correctly on single-layer boards.
-- Vias are being generated, but clearance rules need adjustment to avoid DRC errors.
-- Currently tested on `Simple_Demo.kicad_pcb` and `Simple_Via.kicad_pcb`.
+- Vias are being generated and routing is done through vias.
+- Currently tested on `Simple_Demo.kicad_pcb`, `Simple_Via.kicad_pcb`, `via2.kicac_pcb` and `via3.kicad_pcb`.(Working perfectly)
+- Currently testing on `tht.kicad_pcb`.
 
 ## Next Steps
-- Fix via-to-pad clearance errors.
+- Fix THT components routing.
 - Extend functionality for multi-layer (4-layer) PCBs.
 - Improve routing efficiency and optimization.
 
----
-Maintainer: Raj  

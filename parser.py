@@ -79,11 +79,11 @@ class KiCadParser:
         """
         # Class templates (you can tune these defaults)
         netclasses = {
-            "Default": { "trace_width": 0.25, "clearance": 0.20, "via_size": 0.6, "via_drill": 0.3, "via_cost": 120, "min_via_from_pads": 0.8 },
-            "POWER":   { "trace_width": 0.20, "clearance": 0.20, "via_size": 0.8, "via_drill": 0.4, "via_cost":  90, "min_via_from_pads": 0.8 },
+            "Default": { "trace_width": 0.20, "clearance": 0.20, "via_size": 0.6, "via_drill": 0.3, "via_cost": 60, "min_via_from_pads": 0.8, "reuse_same_net_via": True },
+            "POWER":   { "trace_width": 0.20, "clearance": 0.20, "via_size": 0.8, "via_drill": 0.4, "via_cost":  60, "min_via_from_pads": 0.8, "reuse_same_net_via": True },
             "SWITCH":  { "trace_width": 0.20, "clearance": 0.20, "via_size": 0.8, "via_drill": 0.4,
-                         "via_cost": 220, "min_via_from_pads": 0.8 },
-            "FEEDBACK":{ "trace_width": 0.20, "clearance": 0.20, "via_cost": 300, "min_via_from_pads": 0.5 }
+                         "via_cost": 60, "min_via_from_pads": 0.8, "reuse_same_net_via": True},
+            "FEEDBACK":{ "trace_width": 0.20, "clearance": 0.20, "via_cost": 60, "min_via_from_pads": 0.5, "reuse_same_net_via": True }
         }
 
         # Make sure any allowed_layers listed actually exist on this board
@@ -300,8 +300,10 @@ class KiCadParser:
                 "via_cost": 120,
 
                 # Global halos (independent of class)
+                "via_clearance_extra": 0.1,
+                "tht_clearance_extra": 0.15,
                 "pad_clearance_extra": 0.10,
-                "trace_clearance_extra": 0.00,
+                "trace_clearance_extra": 0.1,
 
                 # Netclass system
                 "default_netclass": "Default",
