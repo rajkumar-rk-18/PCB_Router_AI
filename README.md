@@ -13,7 +13,7 @@ It parses `.kicad_pcb` files, generates routes, and injects them back into the P
 1. Two sample PCB files are included:
    - `Simple_Demo.kicad_pcb`: Single-layer design (works perfectly).
    - `Simple_Via.kicad_pcb`: Modified design with a component on the back layer for via testing.
-   - `via2.kicad_pcb`: It has a THT component to be work on.
+   - `tht.kicad_pcb`: It has a THT component to be work on.
 2. Vias are created successfully.
 3. Currently working on handling Through Hole Components.
 3. Next step: extend support for **4-layer PCBs**.
