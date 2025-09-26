@@ -27,6 +27,7 @@ class Grid:
         # occupancy: occ[layer_index][ix][iy]
         self.occ = [[[False for _ in range(self.ny)] for _ in range(self.nx)] for _ in layers]
         self.pad_mask = [[False for _ in range(self.ny)] for _ in range(self.nx)]
+        
 
     def in_bounds(self, ix, iy):
         return 0 <= ix < self.nx and 0 <= iy < self.ny
@@ -99,7 +100,13 @@ def clear_pad_region(grid, pad, layer):
 
 def set_pad_region(grid, pad, layer):
     shape = pad.get("shape", "circle")
-    clearance = float(pad.get("clearance", 0.2)) + float(RULES.get("pad_clearance_extra", 0.0))
+    base_clear = float(pad.get("clearance", 0.2))
+    pad_extra  = float(RULES.get("pad_clearance_extra", 0.0))
+    tht_extra  = float(RULES.get("tht_clearance_extra", 0.0))
+    # <-- add tht_extra only for "*.Cu"
+    is_tht = (pad.get("layer") == "*.Cu")
+    clearance = base_clear + pad_extra + (tht_extra if is_tht else 0.0)
+
     rot = float(pad.get("abs_rotation", pad.get("pad_rotation", 0.0)))
 
     if shape in ("roundrect", "rect", "oval"):
@@ -127,6 +134,7 @@ def set_pad_region(grid, pad, layer):
                 dx, dy = cx - pad["x"], cy - pad["y"]
                 if dx*dx + dy*dy <= r*r:
                     grid.set_block(ix, iy, layer)
+
 
 
 
@@ -233,46 +241,59 @@ def block_path_as_obstacles(grid, rules, path_cells, vias_raw):
 
 
 
-def find_pad_for_point(obstacles, x, y, layer_name, tol=0.8):
-    """
-    Return the pad (from obstacles) that corresponds to (x,y,layer_name).
-    We use a simple L1 distance and a tolerance in mm.
-    """
-    best = None
-    bestd = 1e9
+def find_pad_for_point(obstacles, x, y, layer_name, tol=0.8, net_id=None):
+    best = None; bestd = 1e9
     for o in obstacles:
         if o.get("type") != "pad":
             continue
+        if net_id is not None and o.get("net_id") != net_id:
+            continue
         pad_layer = o.get("layer")
-        # "*.Cu" matches any copper layer
         if pad_layer and pad_layer not in (layer_name, "*.Cu"):
             continue
-        d = abs(float(o["x"]) - float(x)) + abs(float(o["y"]) - float(y))
+        d = abs(float(o["x"])-float(x)) + abs(float(o["y"])-float(y))
         if d < bestd and d <= tol:
-            best = o
-            bestd = d
+            best, bestd = o, d
     return best
+
 
 
 def clear_full_pad_access(grid, pad, layer_index, rules):
     """
-    Temporarily clear the *entire* pad copper + a small extra so a track fits through.
-    Do this on the pad's routing layer (layer_index). After routing,
-    call set_pad_region(grid, pad, layer_index) to restore blocking.
+    Temporarily clear the pad copper so a track can exit the pad.
+    - SMD pads: keep the existing behavior (base_clear + pad_access_extra)
+    - THT pads (*.Cu): add the THT bump used during rasterization so we don't
+      leave a blocked rim around the hole, i.e.
+        base_clear + pad_clearance_extra + tht_clearance_extra + pad_access_extra
     """
     if not pad:
         return
 
-    # Extra opening so the trace (width) can pass the pad boundary comfortably
-    trace_w = float(rules.get("trace_width", 0.25))
-    extra = float(rules.get("pad_access_extra", 0.5 * trace_w))
+    # Common parts
+    base_clear   = float(pad.get("clearance", float(rules.get("clearance", 0.2))))
+    trace_w      = float(rules.get("trace_width", 0.25))
+    access_extra = float(rules.get("pad_access_extra", 0.5 * trace_w))
 
-    # Use a copy so we don't mutate the original pad dict
+    # Default: SMD behavior (unchanged)
+    open_clear = base_clear + access_extra
+
+    # Only for THT pads (*.Cu), match rasterization model
+    if pad.get("layer") == "*.Cu":
+        pad_extra = float(rules.get("pad_clearance_extra", 0.0))
+        tht_extra = float(rules.get("tht_clearance_extra", 0.0))
+        open_clear = base_clear + pad_extra + tht_extra + access_extra
+
+    # Use a copy so we don't mutate the pad dict
     pad_copy = dict(pad)
-    base_clear = float(pad.get("clearance", float(rules.get("clearance", 0.2))))
-    pad_copy["clearance"] = base_clear + extra
+    pad_copy["clearance"] = open_clear
 
-    clear_pad_region(grid, pad_copy, layer_index)
+    # Clear on all copper layers for THT; only the routing layer for SMD
+    if pad.get("layer") == "*.Cu":
+        for li in range(len(grid.layers)):
+            clear_pad_region(grid, pad_copy, li)
+    else:
+        clear_pad_region(grid, pad_copy, layer_index)
+
 
 
 def compute_coords_extent(obstacles, tasks):
@@ -308,42 +329,39 @@ def expand_boundary_to_include(boundary, minx, maxx, miny, maxy, margin):
 
 def rasterize_obstacles(grid, rules, obstacles):
     """
-    Rasterize pads (SMD + THT) and polygon obstacles into grid. 
-    Rect/roundrect/oval pads use a rotated-rectangle test so rotation/orientation is honored.
-    THT pads ("*.Cu") get an optional extra clearance ring: rules["tht_clearance_extra"].
+    Pads (SMD + THT) and polygons -> grid blocks.
+    Rect/roundrect/oval use a rotated-rectangle test (honors pad rotation).
+    THT pads ("*.Cu") get an extra halo: rules["tht_clearance_extra"].
     """
     clearance_default = float(rules.get("clearance", 0.2))
     pad_extra         = float(rules.get("pad_clearance_extra", 0.0))
-    tht_extra         = float(rules.get("tht_clearance_extra", 0.0))  # <— NEW
+    tht_extra         = float(rules.get("tht_clearance_extra", 0.0))
 
     for obs in obstacles:
         if obs.get("type") == "pad":
             x = float(obs["x"]); y = float(obs["y"])
             shape = obs.get("shape", "circle")
             rot   = float(obs.get("abs_rotation", obs.get("pad_rotation", 0.0)))
-
             layer_name = obs.get("layer")
+
+            # Which layers does this pad block?
             if layer_name == "*.Cu":
-                layers = grid.layers[:]                 # THT: block on all copper layers
+                layers = grid.layers[:]                # THT: all copper layers
             elif layer_name:
                 layers = [layer_name]
             else:
                 layers = grid.layers[:]
 
-            # base + project pad bump (+ extra for THT)
+            # Base + project-wide pad bump (+ extra ring for THT only)
             base_clear = float(obs.get("clearance", clearance_default))
             clearance  = base_clear + pad_extra + (tht_extra if layer_name == "*.Cu" else 0.0)
 
             if shape in ("roundrect", "rect", "oval"):
-                # Treat oval as a rotated rectangle using size_x/size_y
                 hx = float(obs.get("size_x", 0.0)) / 2.0 + clearance
                 hy = float(obs.get("size_y", 0.0)) / 2.0 + clearance
-
-                # scan a bounding box, test with rotated-rect predicate
                 bb = max(hx, hy)
                 ix0, iy0 = grid.world_to_grid(x - bb, y - bb)
                 ix1, iy1 = grid.world_to_grid(x + bb, y + bb)
-
                 for il, lname in enumerate(grid.layers):
                     if lname not in layers:
                         continue
@@ -356,11 +374,10 @@ def rasterize_obstacles(grid, rules, obstacles):
                                 grid.pad_mask[ix][iy] = True
                                 grid.set_block(ix, iy, il)
 
-            elif shape == "circle":
+            else:  # circle
                 r = float(obs.get("radius", 0.2)) + clearance
                 ix0, iy0 = grid.world_to_grid(x - r, y - r)
                 ix1, iy1 = grid.world_to_grid(x + r, y + r)
-
                 for il, lname in enumerate(grid.layers):
                     if lname not in layers:
                         continue
@@ -375,10 +392,8 @@ def rasterize_obstacles(grid, rules, obstacles):
                                 grid.set_block(ix, iy, il)
 
         elif obs.get("polygon"):
-            # Simple polygon grow-by-clearance raster (unchanged)
             poly = obs["polygon"]
-            xs = [px for px, _ in poly]
-            ys = [py for _, py in poly]
+            xs = [px for px,_ in poly]; ys = [py for _,py in poly]
             minx, maxx = min(xs), max(xs)
             miny, maxy = min(ys), max(ys)
             clearance = float(obs.get("clearance", clearance_default))
@@ -393,6 +408,7 @@ def rasterize_obstacles(grid, rules, obstacles):
                     for iy in range(iy0 - grow, iy1 + grow + 1):
                         if grid.in_bounds(ix, iy):
                             grid.set_block(ix, iy, il)
+
 
 
 
@@ -525,14 +541,12 @@ def astar_search(grid, rules, start_state, goal_state, allow_via, start_xy, goal
                 g_score[cand] = tg
                 push_state(cand, tg)
 
-        # ---- via policy (original gating) ----
-        allow_via_here = False
-        if not planar_moves_exist:
-            allow_via_here = True
-        else:
-            current_h = octile(ix, iy, goal_ix, goal_iy)
-            if best_neighbor_heuristic >= current_h - 1e-9:
-                allow_via_here = True
+        # ---- via policy (gentler gating) ----
+        current_h = octile(ix, iy, goal_ix, goal_iy)
+        improvement = current_h - best_neighbor_heuristic if planar_moves_exist else 0.0
+        # allow a via if there are no good planar moves or the best planar step
+        # doesn't improve the heuristic by much (wiggle room = 0.2)
+        allow_via_here = (not planar_moves_exist) or (improvement < 0.2)
 
         # ---- propose via (EARLY-WINDOW + stall gate + full-disk clearance) ----
         if allow_via:
@@ -842,7 +856,7 @@ def route_all(input_data):
     RULES = rules
     obstacles = input_data.get("obstacles", [])
     tasks = input_data.get("tasks", [])
-
+    tasks.sort(key=lambda t: 0 if t.get("net","").upper()=="VCC" else 1)
     boundary = board.get("boundary", []) or []
     layers = board.get("layers", [])
     step = float(rules.get("grid_step", 0.1))
@@ -910,27 +924,19 @@ def route_all(input_data):
         # Try all (startLayer, goalLayer) pairs until one succeeds
         for sL_name in start_layer_names:
             sL = grid.layers.index(sL_name)
-            start_pad = find_pad_for_point(obstacles, start["x"], start["y"], sL_name)
+            start_pad = find_pad_for_point(obstacles, start["x"], start["y"], sL_name, net_id=net_id)
 
             for gL_name in goal_layer_names:
                 gL = grid.layers.index(gL_name)
-                goal_pad = find_pad_for_point(obstacles, goal["x"], goal["y"], gL_name)
+                goal_pad = find_pad_for_point(obstacles, goal["x"], goal["y"], gL_name, net_id=net_id)
 
                 # Open the pad copper (plus extra) on the specific attempt layers
                 # If the pad is "*.Cu" (THT), open on ALL copper layers
                 if start_pad:
-                    if start_pad.get("layer") == "*.Cu":
-                        for li in range(len(grid.layers)):
-                            clear_full_pad_access(grid, start_pad, li, rules_net)
-                    else:
-                        clear_full_pad_access(grid, start_pad, sL, rules_net)
+                    clear_full_pad_access(grid, start_pad, sL, rules_net)
 
                 if goal_pad:
-                    if goal_pad.get("layer") == "*.Cu":
-                        for li in range(len(grid.layers)):
-                            clear_full_pad_access(grid, goal_pad, li, rules_net)
-                    else:
-                        clear_full_pad_access(grid, goal_pad,  gL, rules_net)
+                    clear_full_pad_access(grid, goal_pad,  gL, rules_net)
 
                 # If we have an anchor via, open a small window at its location and steer goal to it (on sL)
                 opened_anchor = False
@@ -956,12 +962,15 @@ def route_all(input_data):
 
                     # Restore pad blocking on success
                     def _restore_pad(pad, default_li):
-                        if not pad: return
+                        if not pad:
+                            return
+                        # Re-block exactly like rasterization did
                         if pad.get("layer") == "*.Cu":
                             for li in range(len(grid.layers)):
                                 set_pad_region(grid, pad, li)
                         else:
                             set_pad_region(grid, pad, default_li)
+
 
                     _restore_pad(start_pad, sL)
                     _restore_pad(goal_pad,  gL)
